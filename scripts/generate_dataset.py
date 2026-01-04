@@ -35,6 +35,7 @@ def generate_dataset(
     output_dir: str = "data/circles",
     chunk_size: int = 16,
     canvas_size: int = 512,
+    use_deltas: bool = False,
 ):
     """
     Generate training dataset from Quick, Draw! circles.
@@ -47,6 +48,7 @@ def generate_dataset(
         output_dir: Output directory for dataset
         chunk_size: Points per chunk (16 like GR00T)
         canvas_size: Canvas size in pixels
+        use_deltas: If True, output delta movements instead of absolute coords
 
     Returns:
         Path to generated dataset
@@ -63,8 +65,9 @@ def generate_dataset(
     stats = get_circle_stats(circles)
     print(f"Dataset stats: {stats}")
 
+    coord_mode = "DELTA" if use_deltas else "ABSOLUTE"
     print(f"\nGenerating training samples (VARIABLE LENGTH - no resampling)...")
-    print(f"Config: chunk_size={chunk_size}, canvas={canvas_size}x{canvas_size}")
+    print(f"Config: chunk_size={chunk_size}, canvas={canvas_size}x{canvas_size}, coords={coord_mode}")
 
     all_samples = []
     sample_idx = 0
@@ -75,7 +78,7 @@ def generate_dataset(
         normalized = normalize_trajectory(np.array(circle_points), original_range=(0, 255))
 
         # Generate chunked training samples (variable number of chunks per circle)
-        samples = generate_training_samples(normalized, chunk_size, canvas_size)
+        samples = generate_training_samples(normalized, chunk_size, canvas_size, use_deltas=use_deltas)
 
         for chunk_idx, sample in enumerate(samples):
             # Save image
@@ -114,6 +117,7 @@ def generate_dataset(
         "variable_length": True,  # Circles keep natural length
         "chunk_size": chunk_size,
         "canvas_size": canvas_size,
+        "use_deltas": use_deltas,  # True = (dx, dy, state), False = (x, y, state)
         "samples": all_samples,
     }
 
@@ -340,6 +344,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="data/circles", help="Output directory")
     parser.add_argument("--chunk_size", type=int, default=16, help="Points per chunk")
     parser.add_argument("--canvas_size", type=int, default=512, help="Canvas size")
+    parser.add_argument("--use_deltas", action="store_true", help="Output delta movements instead of absolute coords")
     parser.add_argument("--upload", action="store_true", help="Upload to HuggingFace")
     parser.add_argument("--repo_id", type=str, default="TESS-Computer/quickdraw-circles", help="HF repo ID")
     parser.add_argument("--private", action="store_true", help="Make HF repo private")
@@ -351,6 +356,7 @@ def main():
         output_dir=args.output_dir,
         chunk_size=args.chunk_size,
         canvas_size=args.canvas_size,
+        use_deltas=args.use_deltas,
     )
 
     # Upload if requested

@@ -54,6 +54,8 @@ def parse_args():
                         help="DiT hidden dimension")
     parser.add_argument("--dit_num_layers", type=int, default=6,
                         help="Number of DiT blocks")
+    parser.add_argument("--use_deltas", action="store_true",
+                        help="Use delta (relative) movements instead of absolute coordinates")
 
     # Training
     parser.add_argument("--output_dir", type=str, default="outputs/dit_draw",
@@ -171,7 +173,12 @@ def main():
     accelerator.print(f"Dataset size: {len(dataset)} samples")
 
     # Create PyTorch dataset
-    train_dataset = DrawDatasetHF(dataset, processor, chunk_size=args.chunk_size)
+    train_dataset = DrawDatasetHF(
+        dataset,
+        processor,
+        chunk_size=args.chunk_size,
+        use_deltas=args.use_deltas,
+    )
 
     # Create dataloader with collate function
     from functools import partial
@@ -309,6 +316,7 @@ def main():
                     "chunk_size": args.chunk_size,
                     "dit_hidden_size": args.dit_hidden_size,
                     "dit_num_layers": args.dit_num_layers,
+                    "use_deltas": args.use_deltas,
                     "best_loss": best_loss,
                 }, f, indent=2)
 

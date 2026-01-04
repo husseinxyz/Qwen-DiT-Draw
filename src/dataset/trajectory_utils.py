@@ -202,16 +202,36 @@ def split_into_chunks_with_state(
     return results
 
 
+def absolute_to_deltas(chunk: np.ndarray) -> np.ndarray:
+    """
+    Convert absolute coordinates to delta movements within a chunk.
+
+    Args:
+        chunk: (N, 3) array with (x, y, state) in absolute coords
+
+    Returns:
+        (N, 3) array with (dx, dy, state)
+        - First point: (x, y, state) - absolute starting position
+        - Rest: (dx, dy, state) - delta from previous point
+    """
+    deltas = chunk.copy()
+    # Keep first point as absolute (starting position)
+    # Convert rest to deltas: current - previous
+    deltas[1:, :2] = chunk[1:, :2] - chunk[:-1, :2]
+    return deltas
+
+
 def generate_training_samples(
     trajectory: np.ndarray,
     chunk_size: int = 16,
-    canvas_size: int = 512
+    canvas_size: int = 512,
+    use_deltas: bool = False,
 ) -> List[dict]:
     """
     Generate training samples from a single trajectory (GR00T-style).
 
     Variable length with done signal:
-    - Each point is (x, y, state)
+    - Each point is (x, y, state) or (dx, dy, state) if use_deltas=True
     - state=0: continue, state=1: done
     - Mask indicates which positions to include in loss
 
@@ -219,12 +239,13 @@ def generate_training_samples(
         trajectory: np.ndarray of shape (T, 2) normalized [0, 1]
         chunk_size: Points per chunk
         canvas_size: Canvas size in pixels
+        use_deltas: If True, output delta movements instead of absolute coords
 
     Returns:
         List of training sample dictionaries with:
         - image: canvas showing previous drawing
         - instruction: text prompt
-        - target_chunk: (chunk_size, 3) with (x, y, state)
+        - target_chunk: (chunk_size, 3) with (x, y, state) or (dx, dy, state)
         - mask: (chunk_size,) with 1=real, 0=ignore
     """
     chunk_results = split_into_chunks_with_state(trajectory, chunk_size)
@@ -236,12 +257,15 @@ def generate_training_samples(
         # Count real points from mask
         n_real = int(mask.sum())
 
+        # Convert to deltas if requested
+        target_chunk = absolute_to_deltas(chunk) if use_deltas else chunk
+
         # Create training sample
         sample = {
             "image": canvas.copy(),
             "instruction": "draw a circle",
-            "target_chunk": chunk,  # (chunk_size, 3) with (x, y, state)
-            "mask": mask,           # (chunk_size,) for loss masking
+            "target_chunk": target_chunk,  # (chunk_size, 3)
+            "mask": mask,                   # (chunk_size,) for loss masking
             "chunk_index": i,
             "is_last": i == len(chunk_results) - 1,
             "n_real_points": n_real,
@@ -249,6 +273,7 @@ def generate_training_samples(
         samples.append(sample)
 
         # Update canvas with ONLY real points (not masked positions)
+        # Always use absolute coords for rendering
         real_xy = chunk[:n_real, :2]
         canvas = render_partial_trajectory(real_xy, canvas_size, existing_canvas=canvas)
 

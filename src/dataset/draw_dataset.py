@@ -3,6 +3,10 @@ PyTorch Dataset for trajectory prediction training.
 
 Loads pre-generated training samples (canvas images + target chunks)
 and prepares them for the Qwen2.5-VL + DiT model.
+
+Supports two coordinate modes:
+- absolute: (x, y) are normalized screen coordinates [0, 1]
+- delta: (dx, dy) are relative movements from previous point
 """
 
 import torch
@@ -12,6 +16,44 @@ from pathlib import Path
 import json
 import numpy as np
 from PIL import Image
+
+
+def absolute_to_deltas(trajectory: np.ndarray) -> np.ndarray:
+    """
+    Convert absolute coordinates to delta movements.
+
+    Args:
+        trajectory: (N, 3) array with (x, y, state)
+
+    Returns:
+        (N, 3) array with (dx, dy, state)
+        - First point: (x, y, state) - absolute starting position
+        - Rest: (dx, dy, state) - delta from previous point
+    """
+    deltas = trajectory.copy()
+    # Keep first point as absolute (starting position)
+    # Convert rest to deltas: current - previous
+    deltas[1:, :2] = trajectory[1:, :2] - trajectory[:-1, :2]
+    return deltas
+
+
+def deltas_to_absolute(deltas: np.ndarray, start_pos: np.ndarray = None) -> np.ndarray:
+    """
+    Convert delta movements back to absolute coordinates.
+
+    Args:
+        deltas: (N, 3) array with (dx, dy, state)
+        start_pos: Optional (2,) starting position. If None, uses deltas[0, :2]
+
+    Returns:
+        (N, 3) array with (x, y, state)
+    """
+    absolute = deltas.copy()
+    if start_pos is not None:
+        absolute[0, :2] = start_pos
+    # Cumulative sum to convert deltas to absolute positions
+    absolute[:, :2] = np.cumsum(absolute[:, :2], axis=0)
+    return absolute
 
 
 class DrawDataset(Dataset):
@@ -111,6 +153,8 @@ class DrawDatasetHF(Dataset):
     - trajectory: List[List[float]] - (chunk_size, 3) with (x, y, state)
     - mask: List[float] - (chunk_size,) - 1=real, 0=ignore
     - is_last: bool
+
+    Supports delta mode for relative movement prediction (GR00T N1.6 style).
     """
 
     def __init__(
@@ -118,17 +162,21 @@ class DrawDatasetHF(Dataset):
         dataset,
         processor=None,
         chunk_size: int = 16,
+        use_deltas: bool = False,
     ):
         """
         Args:
             dataset: HuggingFace Dataset object
             processor: Qwen2.5-VL processor
             chunk_size: Expected chunk size
+            use_deltas: If True, convert (x,y) to (dx,dy) delta movements
         """
         self.dataset = dataset
         self.processor = processor
         self.chunk_size = chunk_size
-        print(f"Loaded {len(dataset)} samples from HuggingFace dataset")
+        self.use_deltas = use_deltas
+        mode = "delta" if use_deltas else "absolute"
+        print(f"Loaded {len(dataset)} samples from HuggingFace dataset (mode: {mode})")
 
     def __len__(self) -> int:
         return len(self.dataset)
@@ -144,6 +192,10 @@ class DrawDatasetHF(Dataset):
         trajectory = np.array(sample["trajectory"], dtype=np.float32)
         mask = np.array(sample["mask"], dtype=np.float32)
         is_last = sample["is_last"]
+
+        # Convert to deltas if enabled
+        if self.use_deltas:
+            trajectory = absolute_to_deltas(trajectory)
 
         return {
             "image": image,
