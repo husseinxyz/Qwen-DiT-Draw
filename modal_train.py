@@ -5,6 +5,9 @@ Usage:
     modal run modal_train.py                      # Train
     modal run modal_train.py --action generate    # Generate dataset
     modal run modal_train.py --action all         # Generate + Train
+    modal run modal_train.py --action test        # Test inference (PNG)
+    modal run modal_train.py --action gif         # Generate demo GIF for Twitter
+    modal run modal_train.py --action list        # List checkpoints
 """
 
 import modal
@@ -38,6 +41,7 @@ image = (
         "matplotlib",
         "huggingface_hub",
         "numpy",
+        "imageio[ffmpeg]",
     )
     .run_commands("mkdir -p /app")
     .add_local_dir("src", remote_path="/app/src", copy=True)
@@ -279,7 +283,7 @@ def inference(image_path: str, instruction: str = "draw a circle"):
     volumes={VOLUME_PATH: volume},
     timeout=300,
 )
-def test_inference(instruction: str = "draw a circle", checkpoint: str = "checkpoint-3500"):
+def test_inference(instruction: str = "draw a circle", checkpoint: str = "best"):
     """
     Test inference with a white canvas and visualize results.
 
@@ -380,70 +384,35 @@ def test_inference(instruction: str = "draw a circle", checkpoint: str = "checkp
     canvas_size = 512
     image = Image.new("RGB", (canvas_size, canvas_size), "white")
 
-    # Multi-chunk inference with visual feedback loop
+    # Single chunk inference (no feedback loop - cleaner test)
     print(f"Running inference: '{instruction}'...")
-    all_points = []
-    max_chunks = 10  # Safety limit
-    chunk_count = 0
 
-    while chunk_count < max_chunks:
-        chunk_count += 1
+    # Prepare inputs
+    messages = [{
+        "role": "user",
+        "content": [
+            {"type": "image", "image": image, "min_pixels": 200704, "max_pixels": 401408},
+            {"type": "text", "text": instruction},
+        ],
+    }]
 
-        # Prepare inputs for current canvas state
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image, "min_pixels": 200704, "max_pixels": 401408},
-                {"type": "text", "text": instruction},
-            ],
-        }]
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
 
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
+    inputs = processor(
+        text=[text],
+        images=image_inputs,
+        return_tensors="pt",
+    )
+    inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
 
-        inputs = processor(
-            text=[text],
-            images=image_inputs,
-            return_tensors="pt",
-        )
-        inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
+    # Predict ONE chunk
+    with torch.no_grad():
+        chunk = model.predict_chunk(**inputs)
 
-        # Predict chunk
-        with torch.no_grad():
-            chunk = model.predict_chunk(**inputs)
-
-        chunk = chunk[0].float().cpu().numpy()  # bf16 -> float32 -> numpy
-        print(f"Chunk {chunk_count}: {len(chunk)} points")
-
-        # Process points and draw on canvas
-        draw = ImageDraw.Draw(image)
-        stop_detected = False
-
-        for i, point in enumerate(chunk):
-            x, y, state = point[0], point[1], point[2]
-            px, py = int(x * canvas_size), int(y * canvas_size)
-
-            all_points.append((x, y, state))
-
-            # Draw point on canvas (visual feedback)
-            if i > 0:
-                prev_x, prev_y = chunk[i-1][0], chunk[i-1][1]
-                prev_px, prev_py = int(prev_x * canvas_size), int(prev_y * canvas_size)
-                draw.line([(prev_px, prev_py), (px, py)], fill='blue', width=3)
-
-            # Check for stop signal
-            if state > 0.5:
-                print(f"  Stop signal detected at point {i+1}")
-                stop_detected = True
-                break
-
-        if stop_detected:
-            break
-
-    print(f"Total: {len(all_points)} points across {chunk_count} chunks")
-
-    # Convert to numpy for visualization
-    chunk = np.array(all_points)
+    chunk = chunk[0].float().cpu().numpy()  # bf16 -> float32 -> numpy
+    chunk_count = 1
+    print(f"Predicted {len(chunk)} points (single chunk)")
 
     # Visualize
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
@@ -502,6 +471,227 @@ def test_inference(instruction: str = "draw a circle", checkpoint: str = "checkp
         "viz_path": viz_path,
         "checkpoint_used": checkpoint,
     }
+
+
+@app.function(
+    gpu="H100",
+    volumes={VOLUME_PATH: volume},
+    timeout=600,
+)
+def generate_gif(
+    instruction: str = "draw a circle",
+    checkpoint: str = "best",
+    fps: int = 15,
+    point_delay: int = 2,
+) -> bytes:
+    """
+    Generate a GIF of the model drawing, perfect for Twitter demos.
+
+    Args:
+        instruction: What to tell the model (default: "draw a circle")
+        checkpoint: Which checkpoint to use ("best", "final", or "checkpoint-XXXX")
+        fps: Frames per second for the GIF (default: 15)
+        point_delay: Frames to hold on each point (default: 2, makes animation smoother)
+
+    Returns:
+        GIF bytes that can be saved locally
+    """
+    import os
+    import sys
+    import torch
+    import json
+    import numpy as np
+    from PIL import Image, ImageDraw, ImageFont
+    import imageio.v3 as iio
+
+    os.chdir("/app")
+    sys.path.insert(0, "/app")
+    sys.path.insert(0, "/app/src")
+
+    from src.model import Qwen2_5_VL_Draw, TrajectoryConfig
+    from transformers import AutoProcessor
+    from qwen_vl_utils import process_vision_info
+
+    # Determine model directory
+    base_dir = f"{VOLUME_PATH}/outputs/dit_draw"
+    if checkpoint in ["best", "final"]:
+        model_dir = os.path.join(base_dir, checkpoint)
+    else:
+        model_dir = os.path.join(base_dir, checkpoint)
+
+    print(f"Loading model from {model_dir}...")
+
+    # Check checkpoint format
+    config_path = os.path.join(model_dir, "config.json")
+    safetensors_path = os.path.join(model_dir, "model.safetensors")
+    trajectory_head_path = os.path.join(model_dir, "trajectory_head.pt")
+
+    model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+    if os.path.exists(config_path):
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+        model_id = config_dict.get("model_id", model_id)
+        config = TrajectoryConfig(
+            chunk_size=config_dict.get("chunk_size", 16),
+            dit_hidden_size=config_dict.get("dit_hidden_size", 512),
+            dit_num_layers=config_dict.get("dit_num_layers", 6),
+        )
+    else:
+        print("Using default config (accelerator checkpoint)")
+        config = TrajectoryConfig()
+
+    # Load model
+    model = Qwen2_5_VL_Draw(
+        model_id=model_id,
+        config=config,
+        freeze_backbone=True,
+        dtype=torch.bfloat16,
+    )
+
+    # Load trained weights
+    if os.path.exists(trajectory_head_path):
+        model.trajectory_head.load_state_dict(torch.load(trajectory_head_path, weights_only=True))
+        print("Loaded trajectory_head.pt")
+    elif os.path.exists(safetensors_path):
+        from safetensors.torch import load_file
+        full_state = load_file(safetensors_path)
+        head_state = {}
+        for k, v in full_state.items():
+            if k.startswith("trajectory_head."):
+                new_key = k.replace("trajectory_head.", "")
+                head_state[new_key] = v
+        if head_state:
+            model.trajectory_head.load_state_dict(head_state)
+            print(f"Loaded {len(head_state)} tensors from model.safetensors")
+        else:
+            raise ValueError("No trajectory_head weights found!")
+    else:
+        raise FileNotFoundError(f"No weights found in {model_dir}")
+
+    model = model.to("cuda").eval()
+    processor = AutoProcessor.from_pretrained(model_id)
+    print("Model loaded!")
+
+    # Create canvas
+    canvas_size = 512
+    canvas = Image.new("RGB", (canvas_size, canvas_size), "white")
+    frames = []
+
+    # Add initial blank frame with instruction text
+    intro_frame = canvas.copy()
+    draw = ImageDraw.Draw(intro_frame)
+    # Add instruction text at top
+    draw.text((canvas_size // 2, 30), f'"{instruction}"', fill="gray", anchor="mm")
+    for _ in range(fps):  # Hold for 1 second
+        frames.append(np.array(intro_frame))
+
+    # Multi-chunk inference with frame capture
+    print(f"Running inference: '{instruction}'...")
+    all_points = []
+    max_chunks = 10
+    chunk_count = 0
+    prev_point = None
+
+    while chunk_count < max_chunks:
+        chunk_count += 1
+
+        # Prepare inputs for current canvas state
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": canvas, "min_pixels": 200704, "max_pixels": 401408},
+                {"type": "text", "text": instruction},
+            ],
+        }]
+
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
+
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
+
+        # Predict chunk
+        with torch.no_grad():
+            chunk = model.predict_chunk(**inputs)
+
+        chunk = chunk[0].float().cpu().numpy()
+        print(f"Chunk {chunk_count}: {len(chunk)} points")
+
+        # Process each point and capture frames
+        draw = ImageDraw.Draw(canvas)
+        stop_detected = False
+
+        for i, point in enumerate(chunk):
+            x, y, state = point[0], point[1], point[2]
+            px, py = int(x * canvas_size), int(y * canvas_size)
+
+            all_points.append((x, y, state))
+
+            # Draw line from previous point
+            if prev_point is not None:
+                draw.line([prev_point, (px, py)], fill="blue", width=3)
+
+            # Draw current point marker
+            draw.ellipse([(px - 4, py - 4), (px + 4, py + 4)], fill="red")
+
+            # Capture frame(s)
+            frame = canvas.copy()
+            frame_draw = ImageDraw.Draw(frame)
+            frame_draw.text((canvas_size // 2, 30), f'"{instruction}"', fill="gray", anchor="mm")
+            frame_draw.text((10, canvas_size - 25), f"Point {len(all_points)}", fill="gray")
+
+            for _ in range(point_delay):
+                frames.append(np.array(frame))
+
+            # Remove point marker for next iteration (keep the line)
+            draw.ellipse([(px - 4, py - 4), (px + 4, py + 4)], fill="blue")
+
+            prev_point = (px, py)
+
+            # Check stop signal
+            if state > 0.5:
+                print(f"  Stop signal at point {i + 1}")
+                stop_detected = True
+                break
+
+        if stop_detected:
+            break
+
+    # Add final frames (hold on completed drawing)
+    final_frame = canvas.copy()
+    final_draw = ImageDraw.Draw(final_frame)
+    final_draw.text((canvas_size // 2, 30), f'"{instruction}"', fill="gray", anchor="mm")
+    final_draw.text((canvas_size // 2, canvas_size - 25), f"Done! {len(all_points)} points", fill="green", anchor="mm")
+    for _ in range(fps * 2):  # Hold for 2 seconds
+        frames.append(np.array(final_frame))
+
+    print(f"Total: {len(all_points)} points, {len(frames)} frames")
+
+    # Create GIF
+    gif_path = f"{VOLUME_PATH}/outputs/dit_draw/demo.gif"
+    iio.imwrite(gif_path, frames, fps=fps, loop=0)
+    print(f"Saved GIF to {gif_path}")
+
+    # Also save as mp4 for better Twitter compatibility
+    mp4_path = f"{VOLUME_PATH}/outputs/dit_draw/demo.mp4"
+    try:
+        iio.imwrite(mp4_path, frames, fps=fps)
+        print(f"Saved MP4 to {mp4_path}")
+    except Exception as e:
+        print(f"MP4 save failed (GIF still available): {e}")
+
+    # Read GIF bytes to return
+    with open(gif_path, "rb") as f:
+        gif_bytes = f.read()
+
+    volume.commit()
+
+    return gif_bytes
 
 
 @app.function(
@@ -594,6 +784,18 @@ def main(
         print(f"\nVisualization saved to: {result.get('viz_path', 'N/A')}")
         print("="*60)
 
+    elif action == "gif":
+        print("Generating demo GIF...")
+        gif_bytes = generate_gif.remote()
+
+        # Save locally
+        output_path = "demo.gif"
+        with open(output_path, "wb") as f:
+            f.write(gif_bytes)
+        print(f"\nSaved GIF to: {output_path}")
+        print(f"File size: {len(gif_bytes) / 1024:.1f} KB")
+        print("\nReady for Twitter!")
+
     else:
         print(f"Unknown action: {action}")
-        print("Valid actions: train, generate, all, list, test")
+        print("Valid actions: train, generate, all, list, test, gif")
