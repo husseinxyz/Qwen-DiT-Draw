@@ -41,18 +41,27 @@ def deltas_to_absolute(deltas: np.ndarray, start_pos: np.ndarray = None) -> np.n
     """
     Convert delta movements back to absolute coordinates.
 
+    For chunk 0 (start_pos=None): first element is absolute, rest are deltas
+        deltas = [abs_start, Δ1, Δ2, ...]
+        cumsum gives correct absolute positions
+
+    For chunk 1+ (start_pos=prev_last_point): ALL elements are deltas
+        deltas = [Δ0, Δ1, Δ2, ...] where Δ0 is delta from prev chunk's last
+        cumsum + start_pos gives correct absolute positions
+
     Args:
         deltas: (N, 3) array with (dx, dy, state)
-        start_pos: Optional (2,) starting position. If None, uses deltas[0, :2]
+        start_pos: (2,) last position from previous chunk. If None, chunk 0 format.
 
     Returns:
-        (N, 3) array with (x, y, state)
+        (N, 3) array with (x, y, state) absolute coordinates
     """
     absolute = deltas.copy()
+    # Cumulative sum of deltas
+    absolute[:, :2] = np.cumsum(deltas[:, :2], axis=0)
+    # For chunk 1+, add the previous chunk's last position
     if start_pos is not None:
-        absolute[0, :2] = start_pos
-    # Cumulative sum to convert deltas to absolute positions
-    absolute[:, :2] = np.cumsum(absolute[:, :2], axis=0)
+        absolute[:, :2] += start_pos
     return absolute
 
 

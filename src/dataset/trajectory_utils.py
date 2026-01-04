@@ -202,21 +202,32 @@ def split_into_chunks_with_state(
     return results
 
 
-def absolute_to_deltas(chunk: np.ndarray) -> np.ndarray:
+def absolute_to_deltas(chunk: np.ndarray, prev_last_point: np.ndarray = None) -> np.ndarray:
     """
-    Convert absolute coordinates to delta movements within a chunk.
+    Convert absolute coordinates to delta movements with cross-chunk continuity.
+
+    This ensures smooth continuity across chunks like robotics VLAs (GR00T N1.6 style).
 
     Args:
         chunk: (N, 3) array with (x, y, state) in absolute coords
+        prev_last_point: (2,) array - last point from previous chunk.
+                         If None, first point stays absolute (chunk 0).
+                         If given, first point becomes delta from it (chunk 1+).
 
     Returns:
-        (N, 3) array with (dx, dy, state)
-        - First point: (x, y, state) - absolute starting position
-        - Rest: (dx, dy, state) - delta from previous point
+        (N, 3) array with deltas:
+        - Chunk 0 (prev_last_point=None): [abs_start, Δ1, Δ2, ...]
+        - Chunk 1+ (prev_last_point given): [Δ_from_prev, Δ1, Δ2, ...]
     """
     deltas = chunk.copy()
-    # Keep first point as absolute (starting position)
-    # Convert rest to deltas: current - previous
+
+    # First point handling
+    if prev_last_point is not None:
+        # Cross-chunk continuity: delta from previous chunk's last point
+        deltas[0, :2] = chunk[0, :2] - prev_last_point
+    # else: keep first point as absolute (starting position for chunk 0)
+
+    # Rest are deltas from previous point within chunk
     deltas[1:, :2] = chunk[1:, :2] - chunk[:-1, :2]
     return deltas
 
@@ -252,13 +263,19 @@ def generate_training_samples(
     samples = []
 
     canvas = create_blank_canvas(canvas_size)
+    prev_last_point = None  # Track last point for cross-chunk delta continuity
 
     for i, (chunk, mask) in enumerate(chunk_results):
         # Count real points from mask
         n_real = int(mask.sum())
 
-        # Convert to deltas if requested
-        target_chunk = absolute_to_deltas(chunk) if use_deltas else chunk
+        # Convert to deltas if requested (with cross-chunk continuity)
+        if use_deltas:
+            target_chunk = absolute_to_deltas(chunk, prev_last_point)
+            # Update prev_last_point for next chunk (use absolute coords)
+            prev_last_point = chunk[n_real - 1, :2].copy()
+        else:
+            target_chunk = chunk
 
         # Create training sample
         sample = {
