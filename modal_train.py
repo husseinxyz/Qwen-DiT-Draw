@@ -384,35 +384,70 @@ def test_inference(instruction: str = "draw a circle", checkpoint: str = "best")
     canvas_size = 512
     image = Image.new("RGB", (canvas_size, canvas_size), "white")
 
-    # Single chunk inference (no feedback loop - cleaner test)
+    # Multi-chunk inference with visual feedback loop (GR00T-style)
     print(f"Running inference: '{instruction}'...")
+    all_points = []
+    max_chunks = 10  # Safety limit
+    chunk_count = 0
 
-    # Prepare inputs
-    messages = [{
-        "role": "user",
-        "content": [
-            {"type": "image", "image": image, "min_pixels": 200704, "max_pixels": 401408},
-            {"type": "text", "text": instruction},
-        ],
-    }]
+    while chunk_count < max_chunks:
+        chunk_count += 1
 
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
+        # Prepare inputs for current canvas state
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image, "min_pixels": 200704, "max_pixels": 401408},
+                {"type": "text", "text": instruction},
+            ],
+        }]
 
-    inputs = processor(
-        text=[text],
-        images=image_inputs,
-        return_tensors="pt",
-    )
-    inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
 
-    # Predict ONE chunk
-    with torch.no_grad():
-        chunk = model.predict_chunk(**inputs)
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
 
-    chunk = chunk[0].float().cpu().numpy()  # bf16 -> float32 -> numpy
-    chunk_count = 1
-    print(f"Predicted {len(chunk)} points (single chunk)")
+        # Predict chunk
+        with torch.no_grad():
+            chunk = model.predict_chunk(**inputs)
+
+        chunk = chunk[0].float().cpu().numpy()  # bf16 -> float32 -> numpy
+        print(f"Chunk {chunk_count}: {len(chunk)} points")
+
+        # Process points and draw on canvas
+        draw = ImageDraw.Draw(image)
+        stop_detected = False
+
+        for i, point in enumerate(chunk):
+            x, y, state = point[0], point[1], point[2]
+            px, py = int(x * canvas_size), int(y * canvas_size)
+
+            all_points.append((x, y, state))
+
+            # Draw point on canvas (visual feedback for next chunk)
+            if i > 0:
+                prev_x, prev_y = chunk[i-1][0], chunk[i-1][1]
+                prev_px, prev_py = int(prev_x * canvas_size), int(prev_y * canvas_size)
+                draw.line([(prev_px, prev_py), (px, py)], fill='black', width=2)
+
+            # Check for stop signal
+            if state > 0.5:
+                print(f"  Stop signal detected at point {i+1}")
+                stop_detected = True
+                break
+
+        if stop_detected:
+            break
+
+    print(f"Total: {len(all_points)} points across {chunk_count} chunks")
+
+    # Convert to numpy for visualization
+    chunk = np.array(all_points)
 
     # Visualize
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
