@@ -28,6 +28,10 @@ Given a screenshot and instruction like *"draw a circle"*, the model predicts a 
 
 ## Architecture
 
+<div align="center">
+<img src="qwen-draw.png" width="700" alt="Qwen-DiT-Draw Architecture">
+</div>
+
 ```
 Input: Screenshot + Text instruction ("draw a smiley face")
                     |
