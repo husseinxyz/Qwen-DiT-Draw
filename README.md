@@ -53,42 +53,115 @@ Input: Screenshot + Text instruction ("draw a smiley face")
             normalized coordinates [0, 1]
 ```
 
-## Method: Flow Matching on Trajectories
+## Design Decisions
 
-Same flow matching approach as GR00T, but for mouse trajectories:
+Key architectural choices inspired by [NVIDIA GR00T N1](https://arxiv.org/abs/2503.14734) for building a general-purpose System 1 model:
+
+### 1. Chunked Prediction (not full trajectory)
+
+**Why?** A general model must handle variable-length tasks - a circle might need 32 points, a complex drawing might need 500.
+
+```
+GR00T approach (what we use):
+┌─────────────────────────────────────────────────────────┐
+│ Chunk 1 → Execute → Chunk 2 → Execute → ... → Done      │
+│ (16 pts)            (16 pts)                            │
+└─────────────────────────────────────────────────────────┘
+
+vs. Fixed-length (what we DON'T use):
+┌─────────────────────────────────────────────────────────┐
+│ Predict all 64 points at once (inflexible)              │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 2. Chunk Size: 16 Points
+
+Matches GR00T's H=16 action horizon. Each inference predicts the next 16 (x, y) mouse positions.
+
+| Chunk Size | Trade-off |
+|------------|-----------|
+| Small (4-8) | Easier prediction, more inference calls |
+| **16 (chosen)** | **Balanced, proven with GR00T** |
+| Large (32+) | Fewer calls, harder prediction |
+
+### 3. Variable Length with Stop Signal
+
+**Why?** Don't force all drawings to same length. Instead, model learns when to stop.
+
+```python
+# Output per chunk: 16 points with state
+[(x1, y1, state), (x2, y2, state), ..., (x16, y16, state)]
+
+# state = 0: continue drawing
+# state = 1: stroke complete (pen lift)
+```
+
+**Example - Drawing a circle (32 points total):**
+```
+Chunk 1: [(x,y,0), (x,y,0), ..., (x,y,0)]  → 16 points, keep going
+Chunk 2: [(x,y,0), (x,y,0), ..., (x,y,1)]  → 16 points, last one says "done"
+```
+
+### 4. Visual Feedback Loop
+
+Model sees the canvas AFTER each chunk is drawn, enabling:
+- Course correction
+- Context-aware continuation
+- Natural stopping based on visual state
+
+```
+Step 1: Blank canvas + "draw circle" → Chunk 1 (16 pts)
+Step 2: Canvas with partial circle   → Chunk 2 (16 pts)
+Step 3: Canvas with more drawn       → Chunk 3 says "done"
+```
+
+---
+
+## Method: Flow Matching on Chunks
+
+Same flow matching approach as GR00T, applied to 16-point chunks:
 
 ### Training
 ```python
-T = 64  # trajectory length (number of points)
+CHUNK_SIZE = 16  # points per chunk
 
-# Sample trajectory from dataset
-target_trajectory = [(x1,y1), ..., (x64,y64)]  # shape: (T, 2)
+# Sample a chunk from trajectory
+target_chunk = trajectory[start:start+16]  # shape: (16, 3) with (x, y, state)
 
 # Sample noise and timestep
-noise = torch.randn(T, 2)
+noise = torch.randn(16, 3)
 t = torch.rand(1)
 
 # Interpolate (flow matching)
-noisy_trajectory = (1 - t) * noise + t * target_trajectory
-velocity_target = target_trajectory - noise
+noisy_chunk = (1 - t) * noise + t * target_chunk
+velocity_target = target_chunk - noise
 
-# Model predicts velocity field
-velocity_pred = model(image, prompt, noisy_trajectory, t)
+# Model predicts velocity field for this chunk
+velocity_pred = model(canvas_image, prompt, noisy_chunk, t)
 loss = MSE(velocity_pred, velocity_target)
 ```
 
-### Inference (Euler Integration)
+### Inference (Chunked Euler Integration)
 ```python
-# Start from pure noise
-trajectory = torch.randn(T, 2)
+canvas = blank_canvas()
+full_trajectory = []
 
-# Iteratively denoise (K=16 steps)
-for k in range(K):
-    t = k / K
-    velocity = model(image, prompt, trajectory, t)
-    trajectory = trajectory + velocity * (1/K)
+while True:
+    # Predict next chunk
+    chunk = torch.randn(16, 3)  # start from noise
 
-# Final trajectory is the predicted drawing
+    for k in range(K):  # K=16 denoising steps
+        t = k / K
+        velocity = model(canvas, prompt, chunk, t)
+        chunk = chunk + velocity * (1/K)
+
+    # Execute chunk
+    for (x, y, state) in chunk:
+        full_trajectory.append((x, y))
+        draw_on_canvas(canvas, x, y)
+
+        if state > 0.5:  # stop signal
+            return full_trajectory
 ```
 
 ## Key Differences from Qwen-DiT-Click
