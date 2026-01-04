@@ -4,16 +4,27 @@
 
 **Vision-Language Model with Diffusion Transformer for Continuous Mouse Trajectory Prediction**
 
-[![Model](https://img.shields.io/badge/HuggingFace-Model-yellow)](https://huggingface.co/TESS-Computer/qwen-dit-draw)
+[![Model](https://img.shields.io/badge/HuggingFace-Model-yellow)](https://huggingface.co/TESS-Computer/qwen-dit-draw-delta)
+[![Dataset](https://img.shields.io/badge/HuggingFace-Dataset-blue)](https://huggingface.co/datasets/TESS-Computer/quickdraw-circles-delta)
 [![Blog](https://img.shields.io/badge/Blog-Post-green)](https://husseinxyz.com/tess/qwen-dit-draw/)
 
 </div>
 
 ---
 
+> **Branch:** `delta` — Uses relative (dx, dy) movements ([GR00T N1.6 style](https://arxiv.org/abs/2503.14734))
+>
+> See [`main` branch](https://github.com/TESS-Computer/qwen-dit-draw/tree/main) for absolute (x, y) coordinates version.
+
+<div align="center">
+<img src="demo_final.gif" width="400" alt="Demo: draw a circle">
+
+*Model drawing a circle using delta movements (3 epochs — needs more training for complete circles)*
+</div>
+
 Extension of [Qwen-DiT-Click](https://github.com/husseinxyz/Qwen-Clicking-DiT) to predict **continuous mouse trajectories** instead of single click points.
 
-Given a screenshot and instruction like *"draw a circle"*, the model predicts a sequence of (x, y) coordinates forming the complete trajectory.
+Given a screenshot and instruction like *"draw a circle"*, the model predicts a sequence of (dx, dy) delta movements forming the complete trajectory.
 
 ## Architecture
 
@@ -289,8 +300,32 @@ python -m src.train.train_draw \
     --data_path quickdraw_dataset \
     --output_dir outputs/dit_draw \
     --trajectory_length 64 \
-    --num_train_epochs 3
+    --num_train_epochs 30
 ```
+
+### Training Epochs: Key Learning from VLA Literature
+
+**VLA models require significantly more epochs than typical LLM/VLM training.**
+
+| Model | Epochs | Data Size | Source |
+|-------|--------|-----------|--------|
+| **OpenVLA** | 27 epochs | 970k trajectories | [Paper](https://arxiv.org/abs/2406.09246) |
+| **GR00T N1** | 100 epochs (finetune) | 3k real + synthetic | [Whitepaper](https://arxiv.org/abs/2503.14734) |
+| **pi0** | 8-12 epochs | 10k+ hours | [Paper](https://arxiv.org/abs/2410.24164) |
+
+> *"Typical LLM or VLM training runs complete at most one or two epochs... In contrast, we found it important for VLA training to iterate through the training dataset significantly more times, with real robot performance continually improving until training action token accuracy surpasses 95%."* — OpenVLA Paper
+
+**Why more epochs doesn't cause overfitting:**
+
+1. **Low loss ≠ learned patterns**: Flow matching loss measures velocity field prediction, not trajectory quality. A model can achieve low loss while predicting "average" trajectories that don't form coherent shapes.
+
+2. **Action prediction compounds errors**: Unlike text where each token is somewhat independent, trajectory points build on each other. Small errors in deltas accumulate into large trajectory drift. The model needs many passes to learn precise, consistent patterns.
+
+3. **Memorization is the goal**: Unlike classification where we want generalization, for action prediction we WANT the model to memorize the exact motion patterns. A circle should always look like a circle.
+
+4. **VLM backbone provides generalization**: The frozen Qwen2.5-VL already understands "circle" semantically. The DiT head just needs to map that understanding to precise motor patterns — which requires repetition.
+
+**Recommendation**: Train for **20-30 epochs minimum** for simple shapes, potentially 50+ for complex trajectories.
 
 ## Inference
 
