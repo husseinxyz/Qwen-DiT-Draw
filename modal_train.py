@@ -758,6 +758,7 @@ def main(
     epochs: int = 3,
     max_samples: int = None,
     repo_id: str = "TESS-Computer/quickdraw-circles",
+    checkpoint: str = "best",
 ):
     """
     Entry point for modal commands.
@@ -806,8 +807,8 @@ def main(
         list_checkpoints.remote()
 
     elif action == "test":
-        print("Running inference test with white canvas...")
-        result = test_inference.remote()
+        print(f"Running inference test with white canvas (checkpoint: {checkpoint})...")
+        result = test_inference.remote(checkpoint=checkpoint)
         print("\n" + "="*60)
         print("INFERENCE RESULT:")
         print("="*60)
