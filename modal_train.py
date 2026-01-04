@@ -532,6 +532,7 @@ def generate_gif(
     checkpoint: str = "best",
     fps: int = 15,
     point_delay: int = 2,
+    use_deltas: bool = True,  # Model trained on deltas
 ) -> bytes:
     """
     Generate a GIF of the model drawing, perfect for Twitter demos.
@@ -636,11 +637,12 @@ def generate_gif(
         frames.append(np.array(intro_frame))
 
     # Multi-chunk inference with frame capture
-    print(f"Running inference: '{instruction}'...")
+    print(f"Running inference: '{instruction}' (use_deltas={use_deltas})...")
     all_points = []
     max_chunks = 10
     chunk_count = 0
-    prev_point = None
+    prev_point = None  # Pixel coords for drawing
+    last_abs_point = None  # Normalized coords for delta conversion
 
     while chunk_count < max_chunks:
         chunk_count += 1
@@ -671,15 +673,40 @@ def generate_gif(
         chunk = chunk[0].float().cpu().numpy()
         print(f"Chunk {chunk_count}: {len(chunk)} points")
 
+        # Debug: print raw predictions
+        print(f"  Raw predictions (first 5): {chunk[:5, :2].tolist()}")
+        print(f"  State values: {chunk[:, 2].tolist()}")
+
         # Process each point and capture frames
         draw = ImageDraw.Draw(canvas)
         stop_detected = False
 
         for i, point in enumerate(chunk):
-            x, y, state = point[0], point[1], point[2]
+            raw_x, raw_y, state = point[0], point[1], point[2]
+
+            # Convert deltas to absolute coordinates if needed
+            if use_deltas:
+                if chunk_count == 1 and i == 0:
+                    # First point of first chunk: absolute starting position
+                    x, y = raw_x, raw_y
+                else:
+                    # All other points: delta from previous
+                    x = last_abs_point[0] + raw_x
+                    y = last_abs_point[1] + raw_y
+                last_abs_point = np.array([x, y])
+            else:
+                x, y = raw_x, raw_y
+
             px, py = int(x * canvas_size), int(y * canvas_size)
+            # Clamp to canvas bounds
+            px = max(0, min(canvas_size - 1, px))
+            py = max(0, min(canvas_size - 1, py))
 
             all_points.append((x, y, state))
+
+            # Debug: print converted coordinates for first few points
+            if len(all_points) <= 5:
+                print(f"    Point {len(all_points)}: raw=({raw_x:.4f}, {raw_y:.4f}) -> abs=({x:.4f}, {y:.4f})")
 
             # Draw line from previous point
             if prev_point is not None:
@@ -774,6 +801,7 @@ def main(
     repo_id: str = "TESS-Computer/quickdraw-circles",
     checkpoint: str = "best",
     use_deltas: bool = False,
+    gif_name: str = "demo.gif",
 ):
     """
     Entry point for modal commands.
@@ -844,8 +872,8 @@ def main(
         print("Generating demo GIF...")
         gif_bytes = generate_gif.remote()
 
-        # Save locally
-        output_path = "demo.gif"
+        # Save locally with custom name
+        output_path = gif_name
         with open(output_path, "wb") as f:
             f.write(gif_bytes)
         print(f"\nSaved GIF to: {output_path}")

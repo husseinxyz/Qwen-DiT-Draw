@@ -319,8 +319,11 @@ class DiTTrajectoryHead(nn.Module):
             velocity = self.forward(chunk, t, cond_tokens)
             chunk = chunk + velocity * dt
 
-        # Clamp to valid range
-        chunk = chunk.clamp(0, 1)
+        # Clamp to valid ranges
+        # x, y can be negative (for delta mode) so use [-1, 1]
+        # state should be [0, 1]
+        chunk[:, :, :2] = chunk[:, :, :2].clamp(-1, 1)  # x, y
+        chunk[:, :, 2:] = chunk[:, :, 2:].clamp(0, 1)   # state
 
         return chunk
 

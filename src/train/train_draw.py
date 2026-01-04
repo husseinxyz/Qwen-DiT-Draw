@@ -173,11 +173,20 @@ def main():
     accelerator.print(f"Dataset size: {len(dataset)} samples")
 
     # Create PyTorch dataset
+    # NOTE: If dataset is already in delta format (e.g., quickdraw-circles-delta),
+    # do NOT convert again! Only convert_to_deltas=True for absolute datasets.
+    # The --use_deltas flag indicates the MODEL uses deltas, not that we should convert.
+    is_delta_dataset = "delta" in args.dataset_id.lower()
+    convert_to_deltas = args.use_deltas and not is_delta_dataset
+
+    if is_delta_dataset and args.use_deltas:
+        accelerator.print("NOTE: Dataset is already in delta format, skipping conversion")
+
     train_dataset = DrawDatasetHF(
         dataset,
         processor,
         chunk_size=args.chunk_size,
-        use_deltas=args.use_deltas,
+        convert_to_deltas=convert_to_deltas,
     )
 
     # Create dataloader with collate function
