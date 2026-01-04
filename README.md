@@ -117,6 +117,72 @@ Step 3: Canvas with more drawn       → Chunk 3 says "done"
 
 ---
 
+## Variable Length Handling (GR00T-style)
+
+Robotic VLAs face a key challenge: they don't know ahead of time how long a task will take.
+
+| Task | Approximate Actions |
+|------|---------------------|
+| Pick up a cup | ~30 actions |
+| Draw a circle | ~32 points |
+| Make a sandwich | ~500 actions |
+| Draw complex art | ~1000+ points |
+
+### Our Approach: Stop Signal + Loss Masking
+
+**Output format:**
+```python
+chunk = [(x1, y1, state), (x2, y2, state), ..., (x16, y16, state)]
+# state = 0: continue drawing
+# state = 1: stroke complete (STOP)
+```
+
+**Key insight:** Model ALWAYS predicts 16 points, but `state=1` means STOP. Points AFTER the stop signal are predicted but NOT executed.
+
+**Example - Short circle (32 points):**
+```
+Chunk 1: 16 points, all state=0 → keep going
+Chunk 2: 16 points, last state=1 → DONE!
+```
+
+**Example - Long squiggle (80 points):**
+```
+Chunk 1: 16 points, state=0 → continue
+Chunk 2: 16 points, state=0 → continue
+Chunk 3: 16 points, state=0 → continue
+Chunk 4: 16 points, state=0 → continue
+Chunk 5: 16 points, last state=1 → DONE!
+```
+
+### Training with Loss Masking
+
+For final chunks with fewer than 16 real points:
+```python
+# Circle with 25 points → Chunk 2 has only 9 real points
+
+chunk = [
+    (x,y,0), (x,y,0), ..., (x,y,1),  # 9 real points
+    (0,0,0), (0,0,0), ..., (0,0,0)   # 7 masked positions
+]
+
+mask = [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0]
+#       ↑ real points (count in loss)  ↑ ignored
+```
+
+**Why masking instead of padding?**
+- Padding distorts the trajectory distribution
+- Masking preserves natural drawing patterns
+- Model learns WHERE to put state=1, not fixed positions
+
+| Approach | Fixed (64 pts) | Variable + Stop Signal |
+|----------|----------------|------------------------|
+| Flexibility | Limited | Unlimited length |
+| Realism | Distorted | Natural drawings |
+| Future-proof | No | Yes - works for any task |
+| Complexity | Simpler | Slightly more complex |
+
+---
+
 ## Method: Flow Matching on Chunks
 
 Same flow matching approach as GR00T, applied to 16-point chunks:
@@ -243,11 +309,87 @@ for x, y in trajectory:
     move_mouse(x * screen_width, y * screen_height)
 ```
 
-## Dataset
+## Dataset: Quick, Draw! Circles
 
-Training on drawing/sketch datasets:
-- **Quick, Draw!**: 50M sketches with stroke data
-- **Synthetic**: Programmatically generated shapes (circles, squares, etc.)
+### The Data Challenge
+
+Most VLM training uses static image-text pairs, but we need **trajectory data** - sequences of (x, y) coordinates representing mouse movements. No large-scale mouse trajectory dataset exists for computer control.
+
+### Our Solution: Quick, Draw!
+
+[Quick, Draw!](https://quickdraw.withgoogle.com/data) contains 50M+ human-drawn sketches with **stroke data** - exactly what we need:
+
+```python
+# Quick, Draw! data format (example circle)
+{
+    "drawing": [
+        [[x1, x2, x3, ...], [y1, y2, y3, ...], [t1, t2, t3, ...]]  # stroke 1
+    ],
+    "word": "circle"
+}
+# Coordinates in [0, 255] range, with timestamps
+```
+
+This gives us real human drawing trajectories - natural, variable-length, with the imperfections that make them realistic.
+
+### Dataset Configuration
+
+| Setting | Value | Reasoning |
+|---------|-------|-----------|
+| **Category** | Circle | Simple shape, single stroke, good for POC |
+| **Samples** | 10,000 circles | Similar to click model (20k), sufficient for POC |
+| **Canvas** | 512×512 white | Fits Qwen2.5-VL optimal range (~448-634px) |
+| **Normalization** | [0, 1] | Consistent with click model |
+| **Chunk size** | 16 points | Matches GR00T action horizon |
+
+### Assumptions and Limitations
+
+**Data Assumptions:**
+1. **Single category only** - Circles for proof of concept. Can extend to all 345 Quick, Draw! categories.
+2. **Single stroke** - Circles are typically drawn in one continuous stroke. Multi-stroke shapes would need pen-lift handling.
+3. **Synthetic canvas** - White background, not real screenshots. Future work: overlay on real UI.
+4. **Fixed instruction** - "draw a circle" for all samples. Future: varied prompts.
+
+**Architecture Assumptions:**
+5. **Frozen VLM backbone** - Only the DiT action head is trained. Qwen2.5-VL weights are frozen.
+6. **Output format: (x, y, state)** - Each point has 3 dimensions. `state=1` means STOP.
+7. **Chunk size = 16** - Model always predicts 16 points per forward pass (like GR00T's H=16).
+8. **Stateless inference** - Each chunk prediction is independent. Model sees current canvas + instruction (repeated every chunk).
+
+**Training Assumptions:**
+9. **Flow matching loss** - MSE between predicted and target velocity fields.
+10. **Loss masking** - Positions after the last real point in final chunks are masked (not padded).
+11. **No data augmentation** - Raw trajectories used as-is. Could add rotation/scaling in future.
+12. **bfloat16 training** - Uses mixed precision for memory efficiency.
+
+### Data Pipeline
+
+```
+Quick, Draw! (streaming from Google Cloud)
+    ↓
+Filter: label == "circle"
+    ↓
+Take: 10,000 samples
+    ↓
+For each sample:
+    1. Parse stroke data → list of (x, y) points
+    2. Normalize [0, 255] → [0, 1]
+    3. Split into 16-point chunks with state signal
+    4. Create canvas image (blank for first chunk, partial for rest)
+    5. Save: {image, instruction, trajectory, mask}
+```
+
+### Generated Dataset Format
+
+```python
+{
+    "image": PIL.Image,           # 512×512 canvas
+    "instruction": "draw a circle",
+    "trajectory": (16, 3),        # (x, y, state) per point
+    "mask": (16,),                # 1=real point, 0=ignore in loss
+    "is_last": bool,              # True if final chunk
+}
+```
 
 ## Roadmap
 

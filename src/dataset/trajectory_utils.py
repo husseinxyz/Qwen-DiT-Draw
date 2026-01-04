@@ -144,37 +144,62 @@ def create_blank_canvas(
     return Image.new("RGB", (canvas_size, canvas_size), background_color)
 
 
-def split_into_chunks(
+def split_into_chunks_with_state(
     trajectory: np.ndarray,
     chunk_size: int = 16
-) -> List[np.ndarray]:
+) -> List[Tuple[np.ndarray, np.ndarray]]:
     """
-    Split trajectory into chunks for training.
+    Split trajectory into chunks with done state signal (GR00T-style).
+
+    Key insight: Model always predicts 16 points, but state=1 means STOP.
+    Points AFTER state=1 are predicted but NOT executed.
+
+    For training, we use a MASK to ignore loss on positions after the real endpoint.
 
     Args:
-        trajectory: np.ndarray of shape (T, 2)
+        trajectory: np.ndarray of shape (T, 2) - just (x, y) coordinates
         chunk_size: Points per chunk
 
     Returns:
-        List of chunks, each of shape (chunk_size, 2)
+        List of (chunk, mask) tuples:
+        - chunk: shape (chunk_size, 3) with (x, y, state)
+        - mask: shape (chunk_size,) with 1=real point, 0=ignore in loss
     """
     n_points = len(trajectory)
     n_chunks = (n_points + chunk_size - 1) // chunk_size  # Ceiling division
 
-    chunks = []
+    results = []
     for i in range(n_chunks):
         start = i * chunk_size
         end = min(start + chunk_size, n_points)
-        chunk = trajectory[start:end]
 
-        # Pad last chunk if needed
-        if len(chunk) < chunk_size:
-            padding = np.tile(chunk[-1:], (chunk_size - len(chunk), 1))
-            chunk = np.concatenate([chunk, padding])
+        # Get raw (x, y) points for this chunk
+        xy_points = trajectory[start:end]
+        n_real_points = len(xy_points)
 
-        chunks.append(chunk)
+        # Create (x, y, state) array - zeros for positions we don't care about
+        chunk = np.zeros((chunk_size, 3))
 
-    return chunks
+        # Create mask: 1 for real points, 0 for positions to ignore
+        mask = np.zeros(chunk_size)
+
+        # Fill in real points
+        chunk[:n_real_points, :2] = xy_points
+        chunk[:n_real_points, 2] = 0  # state=0: continue
+        mask[:n_real_points] = 1  # These points count in loss
+
+        # Mark the LAST real point of the ENTIRE trajectory with state=1
+        is_last_chunk = (i == n_chunks - 1)
+        if is_last_chunk:
+            # Last real point gets state=1 (done)
+            chunk[n_real_points - 1, 2] = 1
+
+        # Positions beyond n_real_points: mask=0, so they're ignored in loss
+        # We set them to zeros (arbitrary, won't affect training)
+
+        results.append((chunk, mask))
+
+    return results
 
 
 def generate_training_samples(
@@ -183,12 +208,12 @@ def generate_training_samples(
     canvas_size: int = 512
 ) -> List[dict]:
     """
-    Generate training samples from a single trajectory.
+    Generate training samples from a single trajectory (GR00T-style).
 
-    Each sample contains:
-    - image: Canvas showing previously drawn points (blank for first chunk)
-    - target_chunk: Next chunk of points to predict
-    - is_last: Whether this is the final chunk
+    Variable length with done signal:
+    - Each point is (x, y, state)
+    - state=0: continue, state=1: done
+    - Mask indicates which positions to include in loss
 
     Args:
         trajectory: np.ndarray of shape (T, 2) normalized [0, 1]
@@ -196,26 +221,36 @@ def generate_training_samples(
         canvas_size: Canvas size in pixels
 
     Returns:
-        List of training sample dictionaries
+        List of training sample dictionaries with:
+        - image: canvas showing previous drawing
+        - instruction: text prompt
+        - target_chunk: (chunk_size, 3) with (x, y, state)
+        - mask: (chunk_size,) with 1=real, 0=ignore
     """
-    chunks = split_into_chunks(trajectory, chunk_size)
+    chunk_results = split_into_chunks_with_state(trajectory, chunk_size)
     samples = []
 
     canvas = create_blank_canvas(canvas_size)
 
-    for i, chunk in enumerate(chunks):
+    for i, (chunk, mask) in enumerate(chunk_results):
+        # Count real points from mask
+        n_real = int(mask.sum())
+
         # Create training sample
         sample = {
             "image": canvas.copy(),
             "instruction": "draw a circle",
-            "target_chunk": chunk,  # (chunk_size, 2)
+            "target_chunk": chunk,  # (chunk_size, 3) with (x, y, state)
+            "mask": mask,           # (chunk_size,) for loss masking
             "chunk_index": i,
-            "is_last": i == len(chunks) - 1,
+            "is_last": i == len(chunk_results) - 1,
+            "n_real_points": n_real,
         }
         samples.append(sample)
 
-        # Update canvas with this chunk drawn
-        canvas = render_partial_trajectory(chunk, canvas_size, existing_canvas=canvas)
+        # Update canvas with ONLY real points (not masked positions)
+        real_xy = chunk[:n_real, :2]
+        canvas = render_partial_trajectory(real_xy, canvas_size, existing_canvas=canvas)
 
     return samples
 

@@ -95,7 +95,7 @@ def predict_chunk(
         num_steps: Inference steps (default from config)
 
     Returns:
-        chunk: (chunk_size, 2) tensor of normalized (x, y) coordinates
+        chunk: (chunk_size, 3) tensor of (x, y, state) where state=1 means done
     """
     if isinstance(image, str):
         image = Image.open(image).convert("RGB")
@@ -133,11 +133,18 @@ def predict_full_trajectory(
     canvas_size: int = 512,
     max_chunks: int = 10,
     device: str = "cuda",
+    stop_threshold: float = 0.5,
 ) -> Tuple[List[Tuple[float, float]], Image.Image]:
     """
     Predict full trajectory with visual feedback loop.
 
-    Iteratively predicts chunks and updates canvas until done.
+    Iteratively predicts chunks and updates canvas until model signals done.
+
+    GR00T-style inference:
+    1. Predict chunk of 16 points with (x, y, state)
+    2. Execute points until state > threshold (STOP signal)
+    3. If no stop signal, update canvas and predict next chunk
+    4. Repeat until done or max_chunks reached
 
     Args:
         model: Trained model
@@ -146,6 +153,7 @@ def predict_full_trajectory(
         canvas_size: Canvas size in pixels
         max_chunks: Maximum number of chunks to predict
         device: Device
+        stop_threshold: State value above which to stop (default 0.5)
 
     Returns:
         (trajectory, final_canvas): List of (x, y) points and final canvas image
@@ -155,25 +163,35 @@ def predict_full_trajectory(
     # Start with blank canvas
     canvas = create_blank_canvas(canvas_size)
     full_trajectory = []
+    done = False
 
     for chunk_idx in range(max_chunks):
-        # Predict next chunk
+        # Predict next chunk: (chunk_size, 3) with (x, y, state)
         chunk = predict_chunk(model, processor, canvas, instruction, device)
         chunk_np = chunk.numpy()
 
-        # Add points to trajectory
+        # Process points, checking for stop signal
+        points_to_draw = []
         for point in chunk_np:
-            full_trajectory.append((float(point[0]), float(point[1])))
+            x, y, state = point[0], point[1], point[2]
+            full_trajectory.append((float(x), float(y)))
+            points_to_draw.append([x, y])
 
-        # Update canvas
-        canvas = render_partial_trajectory(
-            chunk_np,
-            canvas_size=canvas_size,
-            existing_canvas=canvas
-        )
+            # Check stop signal
+            if state > stop_threshold:
+                done = True
+                break
 
-        # TODO: Check for stop signal when implemented
-        # For now, stop after fixed number of chunks
+        # Update canvas with executed points
+        if len(points_to_draw) > 0:
+            canvas = render_partial_trajectory(
+                np.array(points_to_draw),
+                canvas_size=canvas_size,
+                existing_canvas=canvas
+            )
+
+        if done:
+            break
 
     return full_trajectory, canvas
 

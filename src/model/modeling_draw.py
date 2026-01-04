@@ -20,7 +20,7 @@ from transformers import Qwen2VLForConditionalGeneration
 class TrajectoryConfig:
     """Configuration for chunked trajectory prediction (GR00T-style)."""
     chunk_size: int = 16                  # Points per chunk (H=16 like GR00T)
-    action_dim: int = 2                   # (x, y) per point
+    action_dim: int = 3                   # (x, y, state) per point - state=1 means STOP
     dit_hidden_size: int = 512           # DiT hidden dimension
     dit_num_layers: int = 6              # Number of DiT blocks
     dit_num_heads: int = 8               # Attention heads
@@ -295,16 +295,17 @@ class DiTTrajectoryHead(nn.Module):
         Generate chunk via Euler integration (inference).
 
         Returns:
-            chunk: (B, chunk_size, 2) - predicted trajectory chunk
+            chunk: (B, chunk_size, 3) - predicted trajectory chunk with (x, y, state)
         """
         num_steps = num_steps or self.config.num_inference_steps
         B = cond_tokens.shape[0]
         chunk_size = self.config.chunk_size
+        action_dim = self.config.action_dim
         device = cond_tokens.device
         dtype = cond_tokens.dtype
 
         # Start from pure noise
-        chunk = torch.randn(B, chunk_size, 2, device=device, dtype=dtype)
+        chunk = torch.randn(B, chunk_size, action_dim, device=device, dtype=dtype)
 
         # Euler integration
         dt = 1.0 / num_steps
@@ -385,7 +386,8 @@ class Qwen2_5_VL_Draw(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
-        target_trajectory: Optional[torch.Tensor] = None,  # (B, chunk_size, 2)
+        target_trajectory: Optional[torch.Tensor] = None,  # (B, chunk_size, 3)
+        trajectory_mask: Optional[torch.Tensor] = None,    # (B, chunk_size) - 1=real, 0=ignore
     ) -> dict:
         """
         Forward pass for training.
@@ -395,7 +397,8 @@ class Qwen2_5_VL_Draw(nn.Module):
             attention_mask: Attention mask
             pixel_values: Processed image pixels
             image_grid_thw: Image grid dimensions
-            target_trajectory: Target chunk (B, chunk_size, 2) for training
+            target_trajectory: Target chunk (B, chunk_size, 3) with (x, y, state)
+            trajectory_mask: Loss mask (B, chunk_size) - 1=real point, 0=ignore
 
         Returns:
             dict with 'loss' (training) or 'chunk' (inference)
@@ -406,8 +409,8 @@ class Qwen2_5_VL_Draw(nn.Module):
         )
 
         if target_trajectory is not None:
-            # Training: compute flow matching loss
-            loss = self.compute_flow_matching_loss(hidden_states, target_trajectory)
+            # Training: compute flow matching loss with mask
+            loss = self.compute_flow_matching_loss(hidden_states, target_trajectory, trajectory_mask)
             return {"loss": loss}
         else:
             # Inference: sample chunk
@@ -416,20 +419,23 @@ class Qwen2_5_VL_Draw(nn.Module):
 
     def compute_flow_matching_loss(
         self,
-        cond_tokens: torch.Tensor,      # (B, S, hidden)
-        target_trajectory: torch.Tensor  # (B, T, 2)
+        cond_tokens: torch.Tensor,       # (B, S, hidden)
+        target_trajectory: torch.Tensor,  # (B, T, 3) with (x, y, state)
+        trajectory_mask: Optional[torch.Tensor] = None  # (B, T) - 1=real, 0=ignore
     ) -> torch.Tensor:
         """
-        Flow matching loss for trajectory prediction.
+        Flow matching loss for trajectory prediction with masking.
 
         Same as GR00T:
         1. Sample random timestep t ~ U(0, 1)
         2. Sample noise ~ N(0, I)
         3. Interpolate: noisy = (1-t)*noise + t*target
         4. Velocity target: v = target - noise
-        5. Loss: MSE(predicted_velocity, v)
+        5. Loss: MSE(predicted_velocity, v) with mask applied
+
+        Mask is used to ignore padded positions in final chunks.
         """
-        B, T, _ = target_trajectory.shape
+        B, T, D = target_trajectory.shape
         device = target_trajectory.device
         dtype = target_trajectory.dtype
 
@@ -450,8 +456,18 @@ class Qwen2_5_VL_Draw(nn.Module):
         # Predict velocity
         velocity_pred = self.trajectory_head(noisy_trajectory, t, cond_tokens)
 
-        # MSE loss
-        loss = F.mse_loss(velocity_pred, velocity_target)
+        # Compute per-element MSE
+        mse = (velocity_pred - velocity_target) ** 2  # (B, T, D)
+
+        if trajectory_mask is not None:
+            # Apply mask: expand (B, T) -> (B, T, D) for broadcasting
+            mask = trajectory_mask.unsqueeze(-1).expand_as(mse)  # (B, T, D)
+            # Masked mean: only count real points
+            masked_mse = mse * mask
+            loss = masked_mse.sum() / (mask.sum() + 1e-8)
+        else:
+            # No mask: regular MSE
+            loss = mse.mean()
 
         return loss
 

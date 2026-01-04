@@ -242,13 +242,14 @@ def main():
 
         for batch in progress_bar:
             with accelerator.accumulate(model):
-                # Forward pass
+                # Forward pass with trajectory mask for loss masking
                 outputs = model(
                     input_ids=batch["input_ids"],
                     attention_mask=batch["attention_mask"],
                     pixel_values=batch.get("pixel_values"),
                     image_grid_thw=batch.get("image_grid_thw"),
                     target_trajectory=batch["target_trajectory"],
+                    trajectory_mask=batch.get("trajectory_mask"),
                 )
 
                 loss = outputs["loss"]

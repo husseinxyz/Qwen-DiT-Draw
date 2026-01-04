@@ -5,7 +5,7 @@ from .trajectory_utils import (
     denormalize_trajectory,
     render_partial_trajectory,
     create_blank_canvas,
-    split_into_chunks,
+    split_into_chunks_with_state,
     generate_training_samples,
 )
 from .draw_dataset import DrawDataset, DrawDatasetHF, collate_fn, create_dataloader

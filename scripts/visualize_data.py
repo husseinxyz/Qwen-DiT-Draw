@@ -16,7 +16,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.dataset.quickdraw_loader import load_circles, get_circle_stats
 from src.dataset.trajectory_utils import (
-    resample_trajectory,
     normalize_trajectory,
     generate_training_samples,
     render_partial_trajectory,
@@ -31,41 +30,36 @@ def visualize_circle_processing(
     circle_points: list,
     circle_idx: int,
     output_dir: Path,
-    target_length: int = 64,
     chunk_size: int = 16,
     canvas_size: int = 512,
 ):
     """
     Visualize the full processing pipeline for a single circle.
 
+    VARIABLE LENGTH: No resampling - circles keep natural length.
+
     Creates:
     1. Original circle (raw points from Quick, Draw!)
-    2. Resampled circle (64 points)
-    3. Chunked training samples (showing canvas state for each chunk)
+    2. Chunked training samples (variable number based on length)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n--- Circle {circle_idx} ---")
     print(f"Original points: {len(circle_points)}")
 
-    # Step 1: Render original circle
-    original_normalized = normalize_trajectory(np.array(circle_points), original_range=(0, 255))
-    original_canvas = create_blank_canvas(canvas_size)
-    original_rendered = render_partial_trajectory(original_normalized, canvas_size, existing_canvas=original_canvas)
-    original_rendered.save(output_dir / f"circle_{circle_idx}_1_original.png")
-    print(f"Saved: circle_{circle_idx}_1_original.png")
+    # Step 1: Normalize (NO RESAMPLING - keep natural length!)
+    normalized = normalize_trajectory(np.array(circle_points), original_range=(0, 255))
 
-    # Step 2: Resample to fixed length
-    resampled = resample_trajectory(circle_points, target_length)
-    resampled_normalized = normalize_trajectory(resampled, original_range=(0, 255))
-    resampled_canvas = create_blank_canvas(canvas_size)
-    resampled_rendered = render_partial_trajectory(resampled_normalized, canvas_size, existing_canvas=resampled_canvas)
-    resampled_rendered.save(output_dir / f"circle_{circle_idx}_2_resampled_{target_length}pts.png")
-    print(f"Saved: circle_{circle_idx}_2_resampled_{target_length}pts.png (from {len(circle_points)} to {target_length} points)")
+    # Render full circle
+    full_canvas = create_blank_canvas(canvas_size)
+    full_rendered = render_partial_trajectory(normalized, canvas_size, existing_canvas=full_canvas)
+    full_rendered.save(output_dir / f"circle_{circle_idx}_1_full_{len(circle_points)}pts.png")
+    print(f"Saved: circle_{circle_idx}_1_full_{len(circle_points)}pts.png")
 
-    # Step 3: Generate chunked training samples
-    training_samples = generate_training_samples(resampled_normalized, chunk_size, canvas_size)
-    print(f"Generated {len(training_samples)} training samples (chunks of {chunk_size})")
+    # Step 2: Generate chunked training samples (VARIABLE number of chunks)
+    training_samples = generate_training_samples(normalized, chunk_size, canvas_size)
+    num_chunks = len(training_samples)
+    print(f"Generated {num_chunks} training samples ({len(circle_points)} pts / {chunk_size} = {num_chunks} chunks)")
 
     # Create a combined visualization showing the progression
     n_samples = len(training_samples)
@@ -78,7 +72,7 @@ def visualize_circle_processing(
 
     # Add final rendered result
     final_canvas = create_blank_canvas(canvas_size)
-    final_rendered = render_partial_trajectory(resampled_normalized, canvas_size, existing_canvas=final_canvas)
+    final_rendered = render_partial_trajectory(normalized, canvas_size, existing_canvas=final_canvas)
     combined.paste(final_rendered, (n_samples * canvas_size, 30))
 
     # Add labels
@@ -103,8 +97,11 @@ def visualize_circle_processing(
         sample["image"].save(output_dir / f"circle_{circle_idx}_chunk{i}_input.png")
         # Also render what the target chunk looks like
         target_canvas = sample["image"].copy()
+        # Extract only (x, y) from (x, y, state) - first 2 columns
+        n_real = sample["n_real_points"]
+        target_xy = sample["target_chunk"][:n_real, :2]
         target_rendered = render_partial_trajectory(
-            sample["target_chunk"], canvas_size,
+            target_xy, canvas_size,
             existing_canvas=target_canvas,
             line_color=(255, 0, 0)  # Red for target
         )
@@ -119,7 +116,6 @@ def main():
     parser = argparse.ArgumentParser(description="Visualize Quick, Draw! circle processing")
     parser.add_argument("--num_circles", type=int, default=5, help="Number of circles to visualize")
     parser.add_argument("--output_dir", type=str, default="visualizations", help="Output directory")
-    parser.add_argument("--target_length", type=int, default=64, help="Resampled trajectory length")
     parser.add_argument("--chunk_size", type=int, default=16, help="Points per chunk")
     parser.add_argument("--canvas_size", type=int, default=512, help="Canvas size in pixels")
     args = parser.parse_args()
@@ -139,14 +135,13 @@ def main():
     for k, v in stats.items():
         print(f"  {k}: {v}")
 
-    print(f"\nProcessing and visualizing {len(circles)} circles...")
-    print(f"Config: target_length={args.target_length}, chunk_size={args.chunk_size}, canvas={args.canvas_size}x{args.canvas_size}")
+    print(f"\nProcessing and visualizing {len(circles)} circles (VARIABLE LENGTH - no resampling)...")
+    print(f"Config: chunk_size={args.chunk_size}, canvas={args.canvas_size}x{args.canvas_size}")
 
     total_samples = 0
     for i, circle in enumerate(circles):
         samples = visualize_circle_processing(
             circle, i, output_dir,
-            target_length=args.target_length,
             chunk_size=args.chunk_size,
             canvas_size=args.canvas_size,
         )

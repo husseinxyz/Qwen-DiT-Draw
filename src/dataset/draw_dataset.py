@@ -21,7 +21,8 @@ class DrawDataset(Dataset):
     Each sample contains:
     - image: Canvas showing previously drawn points
     - instruction: Text prompt (e.g., "draw a circle")
-    - target_chunk: (chunk_size, 2) normalized coordinates
+    - target_chunk: (chunk_size, 3) normalized coordinates with (x, y, state)
+    - mask: (chunk_size,) - 1=real point, 0=ignore in loss
     - is_last: Whether this is the final chunk (for stop signal)
 
     The dataset is loaded from a pre-generated directory with structure:
@@ -32,8 +33,8 @@ class DrawDataset(Dataset):
                 sample_1.png
                 ...
             trajectories/
-                sample_0.npy
-                sample_1.npy
+                sample_0.npy       # trajectory
+                sample_0_mask.npy  # mask
                 ...
     """
 
@@ -79,9 +80,13 @@ class DrawDataset(Dataset):
         image_path = self.data_dir / "images" / sample_info["image"]
         image = Image.open(image_path).convert("RGB")
 
-        # Load trajectory
+        # Load trajectory (chunk_size, 3) with (x, y, state)
         traj_path = self.data_dir / "trajectories" / sample_info["trajectory"]
         target_chunk = np.load(traj_path).astype(np.float32)
+
+        # Load mask (chunk_size,) - 1=real, 0=ignore
+        mask_path = self.data_dir / "trajectories" / sample_info["mask"]
+        mask = np.load(mask_path).astype(np.float32)
 
         # Get instruction and metadata
         instruction = sample_info["instruction"]
@@ -90,7 +95,8 @@ class DrawDataset(Dataset):
         return {
             "image": image,
             "instruction": instruction,
-            "target_chunk": torch.from_numpy(target_chunk),  # (chunk_size, 2)
+            "target_chunk": torch.from_numpy(target_chunk),  # (chunk_size, 3)
+            "mask": torch.from_numpy(mask),                   # (chunk_size,)
             "is_last": torch.tensor(is_last, dtype=torch.float32),
         }
 
@@ -102,7 +108,8 @@ class DrawDatasetHF(Dataset):
     Expects dataset with columns:
     - image: PIL Image
     - instruction: str
-    - trajectory: List[List[float]] - (chunk_size, 2)
+    - trajectory: List[List[float]] - (chunk_size, 3) with (x, y, state)
+    - mask: List[float] - (chunk_size,) - 1=real, 0=ignore
     - is_last: bool
     """
 
@@ -135,12 +142,14 @@ class DrawDatasetHF(Dataset):
 
         instruction = sample["instruction"]
         trajectory = np.array(sample["trajectory"], dtype=np.float32)
+        mask = np.array(sample["mask"], dtype=np.float32)
         is_last = sample["is_last"]
 
         return {
             "image": image,
             "instruction": instruction,
-            "target_chunk": torch.from_numpy(trajectory),
+            "target_chunk": torch.from_numpy(trajectory),  # (chunk_size, 3)
+            "mask": torch.from_numpy(mask),                 # (chunk_size,)
             "is_last": torch.tensor(is_last, dtype=torch.float32),
         }
 
@@ -163,6 +172,7 @@ def collate_fn(batch: List[Dict[str, Any]], processor) -> Dict[str, torch.Tensor
     images = [sample["image"] for sample in batch]
     instructions = [sample["instruction"] for sample in batch]
     target_chunks = torch.stack([sample["target_chunk"] for sample in batch])
+    masks = torch.stack([sample["mask"] for sample in batch])
     is_last = torch.stack([sample["is_last"] for sample in batch])
 
     # Prepare messages for Qwen2.5-VL
@@ -197,9 +207,10 @@ def collate_fn(batch: List[Dict[str, Any]], processor) -> Dict[str, torch.Tensor
         padding=True,
     )
 
-    # Add trajectory targets
-    inputs["target_trajectory"] = target_chunks  # (B, chunk_size, 2)
-    inputs["is_last"] = is_last  # (B,)
+    # Add trajectory targets and mask
+    inputs["target_trajectory"] = target_chunks   # (B, chunk_size, 3)
+    inputs["trajectory_mask"] = masks             # (B, chunk_size)
+    inputs["is_last"] = is_last                   # (B,)
 
     return inputs
 
