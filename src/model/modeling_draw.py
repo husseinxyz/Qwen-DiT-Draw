@@ -13,7 +13,7 @@ import torch.nn.functional as F
 import math
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
-from transformers import Qwen2VLForConditionalGeneration
+from transformers import Qwen2_5_VLForConditionalGeneration
 
 
 @dataclass
@@ -38,9 +38,11 @@ class SinusoidalPositionalEncoding(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         device = t.device
+        dtype = t.dtype
         half_dim = self.dim // 2
         emb_scale = math.log(10000) / (half_dim - 1)
-        emb = torch.exp(torch.arange(half_dim, device=device) * -emb_scale)
+        # Use same dtype as input
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=dtype) * -emb_scale)
         emb = t.unsqueeze(-1) * emb.unsqueeze(0)
         emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=-1)
         return emb
@@ -88,12 +90,13 @@ class TrajectoryEncoder(nn.Module):
         """
         B, T, _ = noisy_trajectory.shape
         device = noisy_trajectory.device
+        dtype = noisy_trajectory.dtype
 
         # Encode each point
         action_tokens = self.point_encoder(noisy_trajectory)  # (B, T, hidden)
 
-        # Add positional encoding for sequence position
-        positions = torch.arange(T, device=device).float()
+        # Add positional encoding for sequence position (match input dtype)
+        positions = torch.arange(T, device=device, dtype=dtype)
         pos_emb = self.pos_encoder(positions)  # (T, hidden)
         action_tokens = action_tokens + pos_emb.unsqueeze(0)  # (B, T, hidden)
 
@@ -121,7 +124,9 @@ class AdaLayerNorm(nn.Module):
             x: (B, T, hidden) - input tokens
             t_emb: (B, hidden) - timestep embedding
         """
+        orig_dtype = x.dtype
         x = self.norm(x)
+        x = x.to(orig_dtype)  # LayerNorm may output float32, convert back
         scale, shift = self.scale_shift(t_emb).chunk(2, dim=-1)
         # Broadcast scale/shift: (B, hidden) -> (B, 1, hidden)
         x = x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -342,7 +347,7 @@ class Qwen2_5_VL_Draw(nn.Module):
         self.config = config or TrajectoryConfig()
 
         # Load Qwen2.5-VL backbone
-        self.backbone = Qwen2VLForConditionalGeneration.from_pretrained(
+        self.backbone = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             model_id,
             torch_dtype=dtype,
             attn_implementation="sdpa"  # Use SDPA for efficiency
@@ -356,8 +361,10 @@ class Qwen2_5_VL_Draw(nn.Module):
             for param in self.backbone.parameters():
                 param.requires_grad = False
 
-        # DiT trajectory head
+        # DiT trajectory head (same dtype as backbone for consistency)
         self.trajectory_head = DiTTrajectoryHead(self.config)
+        if dtype is not None:
+            self.trajectory_head = self.trajectory_head.to(dtype)
 
     def get_vlm_features(
         self,
@@ -437,10 +444,15 @@ class Qwen2_5_VL_Draw(nn.Module):
         """
         B, T, D = target_trajectory.shape
         device = target_trajectory.device
-        dtype = target_trajectory.dtype
+
+        # Get dtype from the model (trajectory head)
+        model_dtype = next(self.trajectory_head.parameters()).dtype
+
+        # Convert target trajectory to model dtype
+        target_trajectory = target_trajectory.to(model_dtype)
 
         # Sample random timestep for each batch element
-        t = torch.rand(B, device=device, dtype=dtype)
+        t = torch.rand(B, device=device, dtype=model_dtype)
 
         # Sample noise
         noise = torch.randn_like(target_trajectory)
