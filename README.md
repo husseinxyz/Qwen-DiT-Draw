@@ -5,11 +5,16 @@
 **Vision-Language Model with Diffusion Transformer for Continuous Mouse Trajectory Prediction**
 
 [![Model](https://img.shields.io/badge/HuggingFace-Model-yellow)](https://huggingface.co/TESS-Computer/qwen-dit-draw)
+[![Dataset](https://img.shields.io/badge/HuggingFace-Dataset-blue)](https://huggingface.co/datasets/TESS-Computer/quickdraw-circles)
 [![Blog](https://img.shields.io/badge/Blog-Post-green)](https://husseinxyz.com/tess/qwen-dit-draw/)
 
 </div>
 
 ---
+
+> **Branch:** `main` — Uses absolute (x, y) coordinates
+>
+> See [`delta` branch](https://github.com/TESS-Computer/qwen-dit-draw/tree/delta) for relative (dx, dy) movements ([GR00T N1.6 style](https://arxiv.org/abs/2503.14734)).
 
 Extension of [Qwen-DiT-Click](https://github.com/husseinxyz/Qwen-Clicking-DiT) to predict **continuous mouse trajectories** instead of single click points.
 
@@ -289,8 +294,22 @@ python -m src.train.train_draw \
     --data_path quickdraw_dataset \
     --output_dir outputs/dit_draw \
     --trajectory_length 64 \
-    --num_train_epochs 3
+    --num_train_epochs 30
 ```
+
+### Training Epochs: Key Learning from VLA Literature
+
+**VLA models require significantly more epochs than typical LLM/VLM training.**
+
+| Model | Epochs | Data Size | Source |
+|-------|--------|-----------|--------|
+| **OpenVLA** | 27 epochs | 970k trajectories | [Paper](https://arxiv.org/abs/2406.09246) |
+| **GR00T N1** | 100 epochs (finetune) | 3k real + synthetic | [Whitepaper](https://arxiv.org/abs/2503.14734) |
+| **pi0** | 8-12 epochs | 10k+ hours | [Paper](https://arxiv.org/abs/2410.24164) |
+
+> *"Typical LLM or VLM training runs complete at most one or two epochs... In contrast, we found it important for VLA training to iterate through the training dataset significantly more times, with real robot performance continually improving until training action token accuracy surpasses 95%."* — OpenVLA Paper
+
+**Recommendation**: Train for **20-30 epochs minimum** for simple shapes, potentially 50+ for complex trajectories.
 
 ## Inference
 
