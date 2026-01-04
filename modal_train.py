@@ -2,12 +2,16 @@
 Modal.com training script for Qwen-DiT-Draw.
 
 Usage:
-    modal run modal_train.py                      # Train
+    modal run modal_train.py                      # Train (absolute coords)
     modal run modal_train.py --action generate    # Generate dataset
     modal run modal_train.py --action all         # Generate + Train
     modal run modal_train.py --action test        # Test inference (PNG)
     modal run modal_train.py --action gif         # Generate demo GIF for Twitter
     modal run modal_train.py --action list        # List checkpoints
+
+    # Delta mode (relative movements):
+    modal run modal_train.py --action generate --use-deltas --repo-id TESS-Computer/quickdraw-circles-delta
+    modal run modal_train.py --action train --use-deltas --repo-id TESS-Computer/quickdraw-circles-delta --epochs 1
 """
 
 import modal
@@ -73,6 +77,7 @@ def train(
     grad_accum: int = 4,
     lr: float = 1e-4,
     max_samples: int = None,
+    use_deltas: bool = False,
 ):
     """Run training on Modal GPU."""
     import os
@@ -112,10 +117,14 @@ def train(
     if max_samples:
         cmd.extend(["--max_samples", str(max_samples)])
 
+    if use_deltas:
+        cmd.append("--use_deltas")
+
     print("=" * 60)
     print("Starting training...")
     print(f"Dataset: {dataset_id}")
     print(f"Output dir: {output_dir}")
+    print(f"Use deltas: {use_deltas}")
     print("=" * 60)
 
     result = subprocess.run(cmd, cwd="/app")
@@ -144,6 +153,7 @@ def generate_dataset(
     num_circles: int = 10000,
     upload: bool = True,
     repo_id: str = "TESS-Computer/quickdraw-circles",
+    use_deltas: bool = False,
 ):
     """Generate Quick, Draw! circles dataset and upload to HuggingFace."""
     import os
@@ -173,9 +183,13 @@ def generate_dataset(
     if upload:
         cmd.extend(["--upload", "--repo_id", repo_id])
 
+    if use_deltas:
+        cmd.append("--use_deltas")
+
     print("=" * 60)
     print(f"Generating {num_circles} circles...")
     print(f"Output: {data_dir}")
+    print(f"Use deltas: {use_deltas}")
     if upload:
         print(f"Will upload to: {repo_id}")
     print("=" * 60)
@@ -759,6 +773,7 @@ def main(
     max_samples: int = None,
     repo_id: str = "TESS-Computer/quickdraw-circles",
     checkpoint: str = "best",
+    use_deltas: bool = False,
 ):
     """
     Entry point for modal commands.
@@ -770,35 +785,40 @@ def main(
         modal run modal_train.py --action list                # List checkpoints
     """
     if action == "train":
-        print("Starting training on Modal H100...")
+        print(f"Starting training on Modal H100 (deltas={use_deltas})...")
         output_dir = train.remote(
+            dataset_id=repo_id,
             epochs=epochs,
             max_samples=max_samples,
+            use_deltas=use_deltas,
         )
         print(f"Done! Model saved to: {output_dir}")
 
     elif action == "generate":
-        print(f"Generating {num_circles} circles...")
+        print(f"Generating {num_circles} circles (deltas={use_deltas})...")
         data_dir = generate_dataset.remote(
             num_circles=num_circles,
             upload=True,
             repo_id=repo_id,
+            use_deltas=use_deltas,
         )
         print(f"Done! Data saved to: {data_dir}")
 
     elif action == "all":
-        print("Running full pipeline: generate → train")
+        print(f"Running full pipeline: generate → train (deltas={use_deltas})")
         print("\nStep 1: Generate dataset...")
         generate_dataset.remote(
             num_circles=num_circles,
             upload=True,
             repo_id=repo_id,
+            use_deltas=use_deltas,
         )
         print("\nStep 2: Train model...")
         train.remote(
             dataset_id=repo_id,
             epochs=epochs,
             max_samples=max_samples,
+            use_deltas=use_deltas,
         )
         print("\nAll done!")
 
