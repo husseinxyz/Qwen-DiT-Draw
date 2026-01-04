@@ -275,6 +275,236 @@ def inference(image_path: str, instruction: str = "draw a circle"):
 
 
 @app.function(
+    gpu="H100",
+    volumes={VOLUME_PATH: volume},
+    timeout=300,
+)
+def test_inference(instruction: str = "draw a circle", checkpoint: str = "checkpoint-3500"):
+    """
+    Test inference with a white canvas and visualize results.
+
+    Args:
+        instruction: What to tell the model (default: "draw a circle")
+        checkpoint: Which checkpoint to use ("best", "final", or "checkpoint-XXXX")
+    """
+    import os
+    import sys
+    import torch
+    import json
+    import numpy as np
+    from PIL import Image, ImageDraw
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    import matplotlib.pyplot as plt
+
+    os.chdir("/app")
+    sys.path.insert(0, "/app")
+    sys.path.insert(0, "/app/src")
+
+    from src.model import Qwen2_5_VL_Draw, TrajectoryConfig
+    from transformers import AutoProcessor
+    from qwen_vl_utils import process_vision_info
+
+    # Determine model directory
+    base_dir = f"{VOLUME_PATH}/outputs/dit_draw"
+    if checkpoint in ["best", "final"]:
+        model_dir = os.path.join(base_dir, checkpoint)
+    else:
+        model_dir = os.path.join(base_dir, checkpoint)
+
+    print(f"Loading model from {model_dir}...")
+
+    # Check if this is an accelerator checkpoint or our custom format
+    config_path = os.path.join(model_dir, "config.json")
+    safetensors_path = os.path.join(model_dir, "model.safetensors")
+    trajectory_head_path = os.path.join(model_dir, "trajectory_head.pt")
+
+    # Default config (used for accelerator checkpoints)
+    model_id = "Qwen/Qwen2.5-VL-3B-Instruct"
+
+    if os.path.exists(config_path):
+        # Our custom format with config.json
+        with open(config_path, "r") as f:
+            config_dict = json.load(f)
+        model_id = config_dict.get("model_id", model_id)
+        config = TrajectoryConfig(
+            chunk_size=config_dict.get("chunk_size", 16),
+            dit_hidden_size=config_dict.get("dit_hidden_size", 512),
+            dit_num_layers=config_dict.get("dit_num_layers", 6),
+        )
+    else:
+        # Accelerator checkpoint - use defaults
+        print("Using default config (accelerator checkpoint)")
+        config = TrajectoryConfig()
+
+    # Load model
+    model = Qwen2_5_VL_Draw(
+        model_id=model_id,
+        config=config,
+        freeze_backbone=True,
+        dtype=torch.bfloat16,
+    )
+
+    # Load trained weights
+    if os.path.exists(trajectory_head_path):
+        # Our custom format
+        model.trajectory_head.load_state_dict(torch.load(trajectory_head_path, weights_only=True))
+        print("Loaded trajectory_head.pt")
+    elif os.path.exists(safetensors_path):
+        # Accelerator checkpoint - extract trajectory head weights from full model
+        from safetensors.torch import load_file
+        full_state = load_file(safetensors_path)
+
+        # Filter for trajectory_head keys
+        head_state = {}
+        for k, v in full_state.items():
+            if k.startswith("trajectory_head."):
+                new_key = k.replace("trajectory_head.", "")
+                head_state[new_key] = v
+
+        if head_state:
+            model.trajectory_head.load_state_dict(head_state)
+            print(f"Loaded {len(head_state)} tensors from model.safetensors")
+        else:
+            raise ValueError("No trajectory_head weights found in safetensors!")
+    else:
+        raise FileNotFoundError(f"No weights found in {model_dir}. Available: {os.listdir(model_dir)}")
+
+    model = model.to("cuda").eval()
+    print("Model loaded!")
+
+    # Load processor
+    processor = AutoProcessor.from_pretrained(model_id)
+
+    # Create white canvas
+    canvas_size = 512
+    image = Image.new("RGB", (canvas_size, canvas_size), "white")
+
+    # Multi-chunk inference with visual feedback loop
+    print(f"Running inference: '{instruction}'...")
+    all_points = []
+    max_chunks = 10  # Safety limit
+    chunk_count = 0
+
+    while chunk_count < max_chunks:
+        chunk_count += 1
+
+        # Prepare inputs for current canvas state
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image, "min_pixels": 200704, "max_pixels": 401408},
+                {"type": "text", "text": instruction},
+            ],
+        }]
+
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, _, _ = process_vision_info(messages, return_video_kwargs=True)
+
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to("cuda") if torch.is_tensor(v) else v for k, v in inputs.items()}
+
+        # Predict chunk
+        with torch.no_grad():
+            chunk = model.predict_chunk(**inputs)
+
+        chunk = chunk[0].float().cpu().numpy()  # bf16 -> float32 -> numpy
+        print(f"Chunk {chunk_count}: {len(chunk)} points")
+
+        # Process points and draw on canvas
+        draw = ImageDraw.Draw(image)
+        stop_detected = False
+
+        for i, point in enumerate(chunk):
+            x, y, state = point[0], point[1], point[2]
+            px, py = int(x * canvas_size), int(y * canvas_size)
+
+            all_points.append((x, y, state))
+
+            # Draw point on canvas (visual feedback)
+            if i > 0:
+                prev_x, prev_y = chunk[i-1][0], chunk[i-1][1]
+                prev_px, prev_py = int(prev_x * canvas_size), int(prev_y * canvas_size)
+                draw.line([(prev_px, prev_py), (px, py)], fill='blue', width=3)
+
+            # Check for stop signal
+            if state > 0.5:
+                print(f"  Stop signal detected at point {i+1}")
+                stop_detected = True
+                break
+
+        if stop_detected:
+            break
+
+    print(f"Total: {len(all_points)} points across {chunk_count} chunks")
+
+    # Convert to numpy for visualization
+    chunk = np.array(all_points)
+
+    # Visualize
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    # Convert to pixel coords
+    x_coords = chunk[:, 0] * canvas_size
+    y_coords = chunk[:, 1] * canvas_size
+
+    # Plot 1: Trajectory overlay
+    axes[0].imshow(image)
+    axes[0].plot(x_coords, y_coords, 'b-', linewidth=2)
+    axes[0].scatter(x_coords[0], y_coords[0], c='green', s=100, marker='o', label='Start')
+    axes[0].scatter(x_coords[-1], y_coords[-1], c='red', s=100, marker='x', label='End')
+    axes[0].set_title(f'Predicted Trajectory ({len(chunk)} pts, {chunk_count} chunks)\n"{instruction}"')
+    axes[0].legend()
+    axes[0].axis('off')
+
+    # Plot 2: Draw the stroke
+    canvas_with_stroke = image.copy()
+    draw = ImageDraw.Draw(canvas_with_stroke)
+    for i in range(len(x_coords) - 1):
+        draw.line(
+            [(x_coords[i], y_coords[i]), (x_coords[i+1], y_coords[i+1])],
+            fill='blue', width=3
+        )
+    axes[1].imshow(canvas_with_stroke)
+    axes[1].set_title('Drawn Result')
+    axes[1].axis('off')
+
+    # Plot 3: Normalized space
+    axes[2].plot(chunk[:, 0], chunk[:, 1], 'b-', linewidth=2)
+    colors = plt.cm.viridis(np.linspace(0, 1, len(chunk)))
+    axes[2].scatter(chunk[:, 0], chunk[:, 1], c=colors, s=30)
+    axes[2].scatter(chunk[0, 0], chunk[0, 1], c='green', s=100, marker='o', zorder=5)
+    axes[2].scatter(chunk[-1, 0], chunk[-1, 1], c='red', s=100, marker='x', zorder=5)
+    axes[2].set_xlim(0, 1)
+    axes[2].set_ylim(1, 0)
+    axes[2].set_aspect('equal')
+    axes[2].set_title('Trajectory (normalized)')
+    axes[2].grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    viz_path = f"{VOLUME_PATH}/outputs/dit_draw/test_result.png"
+    plt.savefig(viz_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved visualization to {viz_path}")
+
+    # Commit to volume
+    volume.commit()
+
+    return {
+        "instruction": instruction,
+        "chunk": chunk.tolist(),
+        "chunk_size": len(chunk),
+        "num_chunks": chunk_count,
+        "viz_path": viz_path,
+        "checkpoint_used": checkpoint,
+    }
+
+
+@app.function(
     volumes={VOLUME_PATH: volume},
     timeout=60,
 )
@@ -350,6 +580,20 @@ def main(
         print("Listing checkpoints on volume...")
         list_checkpoints.remote()
 
+    elif action == "test":
+        print("Running inference test with white canvas...")
+        result = test_inference.remote()
+        print("\n" + "="*60)
+        print("INFERENCE RESULT:")
+        print("="*60)
+        print(f"Instruction: {result['instruction']}")
+        print(f"Predicted {result['chunk_size']} points")
+        print("\nTrajectory (x, y, state):")
+        for i, point in enumerate(result['chunk']):
+            print(f"  {i:2d}: ({point[0]:.3f}, {point[1]:.3f}, {point[2]:.3f})")
+        print(f"\nVisualization saved to: {result.get('viz_path', 'N/A')}")
+        print("="*60)
+
     else:
         print(f"Unknown action: {action}")
-        print("Valid actions: train, generate, all, list")
+        print("Valid actions: train, generate, all, list, test")
