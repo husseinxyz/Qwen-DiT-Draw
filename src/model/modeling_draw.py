@@ -18,8 +18,8 @@ from transformers import Qwen2VLForConditionalGeneration
 
 @dataclass
 class TrajectoryConfig:
-    """Configuration for trajectory prediction."""
-    trajectory_length: int = 64          # Number of points in trajectory (T)
+    """Configuration for chunked trajectory prediction (GR00T-style)."""
+    chunk_size: int = 16                  # Points per chunk (H=16 like GR00T)
     action_dim: int = 2                   # (x, y) per point
     dit_hidden_size: int = 512           # DiT hidden dimension
     dit_num_layers: int = 6              # Number of DiT blocks
@@ -292,38 +292,41 @@ class DiTTrajectoryHead(nn.Module):
         num_steps: Optional[int] = None
     ) -> torch.Tensor:
         """
-        Generate trajectory via Euler integration (inference).
+        Generate chunk via Euler integration (inference).
 
         Returns:
-            trajectory: (B, T, 2) - predicted trajectory
+            chunk: (B, chunk_size, 2) - predicted trajectory chunk
         """
         num_steps = num_steps or self.config.num_inference_steps
         B = cond_tokens.shape[0]
-        T = self.config.trajectory_length
+        chunk_size = self.config.chunk_size
         device = cond_tokens.device
         dtype = cond_tokens.dtype
 
         # Start from pure noise
-        trajectory = torch.randn(B, T, 2, device=device, dtype=dtype)
+        chunk = torch.randn(B, chunk_size, 2, device=device, dtype=dtype)
 
         # Euler integration
         dt = 1.0 / num_steps
         for i in range(num_steps):
             t = torch.full((B,), i / num_steps, device=device, dtype=dtype)
-            velocity = self.forward(trajectory, t, cond_tokens)
-            trajectory = trajectory + velocity * dt
+            velocity = self.forward(chunk, t, cond_tokens)
+            chunk = chunk + velocity * dt
 
         # Clamp to valid range
-        trajectory = trajectory.clamp(0, 1)
+        chunk = chunk.clamp(0, 1)
 
-        return trajectory
+        return chunk
 
 
 class Qwen2_5_VL_Draw(nn.Module):
     """
     Full model: Qwen2.5-VL backbone + DiT trajectory head.
 
-    Frozen VLM extracts features, trainable DiT predicts trajectories.
+    GR00T-style chunked prediction:
+    - Frozen VLM extracts features from canvas image + instruction
+    - Trainable DiT predicts next chunk of 16 (x, y) points
+    - Visual feedback loop: model sees canvas after each chunk is drawn
     """
 
     def __init__(
@@ -382,12 +385,20 @@ class Qwen2_5_VL_Draw(nn.Module):
         attention_mask: torch.Tensor,
         pixel_values: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.Tensor] = None,
-        target_trajectory: Optional[torch.Tensor] = None,  # (B, T, 2)
+        target_trajectory: Optional[torch.Tensor] = None,  # (B, chunk_size, 2)
     ) -> dict:
         """
         Forward pass for training.
 
-        If target_trajectory is provided, computes flow matching loss.
+        Args:
+            input_ids: Tokenized text input
+            attention_mask: Attention mask
+            pixel_values: Processed image pixels
+            image_grid_thw: Image grid dimensions
+            target_trajectory: Target chunk (B, chunk_size, 2) for training
+
+        Returns:
+            dict with 'loss' (training) or 'chunk' (inference)
         """
         # Get VLM features
         hidden_states = self.get_vlm_features(
@@ -399,9 +410,9 @@ class Qwen2_5_VL_Draw(nn.Module):
             loss = self.compute_flow_matching_loss(hidden_states, target_trajectory)
             return {"loss": loss}
         else:
-            # Inference: sample trajectory
-            trajectory = self.trajectory_head.sample(hidden_states)
-            return {"trajectory": trajectory}
+            # Inference: sample chunk
+            chunk = self.trajectory_head.sample(hidden_states)
+            return {"chunk": chunk}
 
     def compute_flow_matching_loss(
         self,
@@ -445,7 +456,7 @@ class Qwen2_5_VL_Draw(nn.Module):
         return loss
 
     @torch.no_grad()
-    def predict_trajectory(
+    def predict_chunk(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
@@ -453,12 +464,17 @@ class Qwen2_5_VL_Draw(nn.Module):
         image_grid_thw: Optional[torch.Tensor] = None,
         num_steps: Optional[int] = None
     ) -> torch.Tensor:
-        """Generate trajectory for inference."""
+        """
+        Generate next trajectory chunk for inference.
+
+        Returns:
+            chunk: (B, chunk_size, 2) - normalized (x, y) coordinates
+        """
         hidden_states = self.get_vlm_features(
             input_ids, attention_mask, pixel_values, image_grid_thw
         )
-        trajectory = self.trajectory_head.sample(hidden_states, num_steps)
-        return trajectory
+        chunk = self.trajectory_head.sample(hidden_states, num_steps)
+        return chunk
 
 
 # Utility function for counting trainable parameters
